@@ -97,7 +97,7 @@ docs/adr/                 架构决策记录
 | 事实存储 | PostgreSQL | 单一权威来源，暂不维护第二套生产 Repository |
 | 全文检索 | 中文分词 Provider＋PostgreSQL 全文检索 | 用中英文、术语和授权过滤样本验证；不将其自动称为 BM25 |
 | 向量检索 | pgvector，先精确再评估 ANN | 以目标容量、召回和过滤测试决定索引类型 |
-| 原文件 | S3 兼容对象存储，产品待 V-02 验证 | 本地文件仅作测试替身，不替代企业验收的对象存储链路 |
+| 原文件 | S3 兼容对象存储，候选 SeaweedFS，S1b 样本验证后确认（MinIO 社区版已停止维护，见 ADR-0001） | 本地文件仅作测试替身，不替代企业验收的对象存储链路 |
 | 任务与事件 | PostgreSQL 任务表、Outbox、独立 Worker | 吞吐和故障域证明需要后再引入队列中间件 |
 | 身份 | OIDC；本地 Keycloak | 企业 IdP 通过标准契约接入，不绑定其内部表或专有 SDK |
 | 前端 | React、TypeScript、Ant Design、TanStack Query | 按门户／工作台／控制台组织，不复制平台业务组件 |
