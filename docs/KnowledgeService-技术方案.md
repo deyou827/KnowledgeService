@@ -51,6 +51,43 @@ Domain 不导入 FastAPI、ORM、模型 SDK 或 OrchestrationPlatform。Applicat
 | Quality Operations | 反馈、评测、对照实验和修复验证 | 绕过资源授权读取所有知识 |
 | Operations | 配额、任务运行、告警、清理和恢复 | 将技术日志作为正文存储 |
 
+### 2.2 代码结构与依赖规则
+
+目标结构如下。目录在对应阶段按需建立，不预建空包；这里定的是边界与依赖方向，不代表已存在。
+
+```text
+contracts/openapi/        /v1 OpenAPI，对外唯一契约，契约测试依据
+contracts/CHANGELOG.md    兼容性变更记录
+src/knowledge_service/
+  domain/                 领域对象与规则
+  capabilities/           第 5 节各 Capability 的 Protocol
+  application/            用例：摄取、发布、检索、回答、治理、质量
+  providers/              默认实现：postgres、object_storage、oidc、parsing、embedding 等
+  api/                    HTTP 路由与 DTO
+  worker/                 任务领取、租约、阶段执行
+  composition.py          装配根
+migrations/               显式一次性数据库迁移
+cli/                      CLI，契约的真实调用方（S1 之后）
+web/                      门户／工作台／控制台（S3b 之后）
+deploy/                   Dockerfile、Compose、环境变量示例
+tests/{unit,integration,fault,security,evaluation,fixtures}
+docs/adr/                 架构决策记录
+```
+
+依赖规则（用 import 检查工具在 S1a 落地为自动测试，而不只是文字约定）：
+
+1. `domain` 不导入任何其他包，也不导入框架、ORM、模型 SDK。
+2. `capabilities` 只依赖 `domain`。
+3. `application` 只依赖 `domain` 与 `capabilities`，不导入 `providers`、`api`、`worker`。
+4. `providers` 实现 `capabilities`，可依赖 `domain`，不依赖 `application`、`api`、`worker`；Provider 之间不互相导入。
+5. `api` 与 `worker` 是平级入口，只调用 `application`，不直接访问 `providers`。
+6. 只有 `composition.py` 同时知道 `providers` 与 `application`，负责依赖注入。
+7. 不导入 OrchestrationPlatform 的任何模块；与平台的一切交互只经 `contracts/openapi`。
+
+测试按成本和依赖分层，分别运行：`unit` 与 `security`（合成数据，默认不调模型、不联网）、`integration`（真实 PostgreSQL、对象存储、OIDC，需单独条件）、`fault`（租约、并发、重放）、`evaluation`（固定数据集与真实模型，调用前需确认外发范围与预算）。`fixtures` 提供合成资料和至少两租户夹具。
+
+取舍：不拆多个 Python 包或服务，依赖方向靠包边界和 import 检查约束；`api` 与 `worker` 不并入 `application`，保证两种入口走同一批用例；`migrations` 放在应用包外，因为迁移是显式作业，API 与 Worker 不并发改表。包名与布局在 S1a 开工时随技术栈锁定。架构决策记录在 `docs/adr/`，每条写明被放弃的备选。
+
 ## 3. 默认技术栈与扩展条件
 
 | 层 | 默认方向 | 替换或扩展条件 |

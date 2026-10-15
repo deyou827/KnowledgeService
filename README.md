@@ -29,12 +29,14 @@
 ## 目录
 
 ```text
-docs/            PRD、技术方案、设计依据、实施计划与开发入口
-contracts/       服务契约、OpenAPI 与兼容性说明
-src/             应用装配、核心流程与 Provider 实现
-tests/           契约、模块、权限和端到端测试
+docs/            PRD、技术方案、设计依据、实施计划、开发入口与 adr/
+contracts/       对外 OpenAPI 与兼容性变更记录
+src/             knowledge_service 包：domain、capabilities、application、providers、api、worker
+tests/           unit、security、integration、fault、evaluation 分层测试
 deploy/          本地 Compose 与后续部署配置
 ```
+
+另有 `migrations/`、`cli/`、`web/` 按阶段建立。依赖方向与完整结构见[技术方案 2.2](docs/KnowledgeService-技术方案.md)。
 
 ## 开发依据
 
