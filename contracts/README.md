@@ -1,8 +1,10 @@
 # 服务契约
 
-本目录是知识服务对外的唯一契约位置：`openapi/` 存放 `/v1` OpenAPI，`CHANGELOG.md` 记录兼容性变更。目前尚未定义正式端点。
+本目录是知识服务对外的唯一契约位置：`openapi/` 存放 `/v1` OpenAPI，`CHANGELOG.md` 记录兼容性变更。目前尚未生成正式 OpenAPI 文件或实现端点。
 
 资源设计、错误结构、幂等、关联标识和兼容性规则见[技术方案第 11 节](../docs/KnowledgeService-技术方案.md)，这里不重复维护。
+
+首批字段、状态、接口与 SSE 设计输入见[核心链路详细设计第 8 节](../docs/KnowledgeService-核心链路详细设计.md#8-首批-api-规格)，操作与交付权威仍以 ADR-0003 为准。S1a 将其转成正式 schema、正负样例和契约测试；文档表格不等同于可执行 OpenAPI。
 
 约定：
 

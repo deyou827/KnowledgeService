@@ -19,7 +19,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | KnowledgeService | 资料来源、解析、文档版本、索引发布、权限过滤检索、问答、引用与证据校验、受控历史回读 |
-| OrchestrationPlatform | 用户入口、Agent/Run 编排、平台身份与项目上下文、模型配置、知识服务 Provider 适配 |
+| OrchestrationPlatform | 平台入口、Agent/Run 编排、平台身份与项目上下文、平台自身模型配置、知识服务 Provider 适配；不拥有知识服务内部模型配置 |
 | 服务契约 | 认证身份与作用域、资源标识、请求响应、错误码、幂等与版本语义 |
 
 服务必须自行验证调用方身份、Tenant／Workspace 与资源权限；平台 Project 显式映射到 Workspace，不能信任调用方自报的作用域。共享服务凭据不自动等于终端用户知识访问权限；委托方案按现行技术方案与阶段门禁确认。
@@ -32,17 +32,19 @@
 docs/            PRD、技术方案、设计依据、实施计划、开发入口与 adr/
 contracts/       对外 OpenAPI 与兼容性变更记录
 src/             knowledge_service 包：domain、capabilities、application、providers、api、worker
-tests/           unit、security、integration、fault、evaluation 分层测试
+tests/           architecture、unit、security、integration、fault、evaluation 分层测试
 deploy/          本地 Compose 与后续部署配置
+web/             独立前端职责与目录入口，尚无应用实现
+migrations/      显式迁移作业职责入口，尚无迁移脚本
 ```
 
-另有 `migrations/`、`cli/`、`web/` 按阶段建立。依赖方向与完整结构见[技术方案 2.2](docs/KnowledgeService-技术方案.md)。
+`web/` 与 `migrations/` 当前只有职责说明；应用子目录、迁移脚本和 `cli/` 在对应阶段按需建立，不预建空包。依赖方向与完整结构见[技术方案 2.2](docs/KnowledgeService-技术方案.md)。
 
 ## 开发依据
 
 产品范围、技术选型、需求编号与阶段门禁统一以 [现行方案](docs/README.md) 为准，不在这里维护另一份实施顺序。
 
-默认架构方向为模块化单体、PostgreSQL＋pgvector、对象存储、OIDC／Keycloak 和独立加工 Worker；具体产品、依赖版本、模型及参数按方案验证项确认。这些是设计方向，不代表已有可运行实现。
+默认架构为模块化单体、PostgreSQL＋pgvector、对象存储、OIDC／Keycloak 和独立加工 Worker；LlamaIndex 负责摄取转换，LangChain 负责模型适配，Ragas 辅助评测，业务与授权检索由项目控制。理由与边界见 [ADR-0004](docs/adr/0004-rag-component-architecture.md)，最终架构图及目录规划见[技术方案第 2 节](docs/KnowledgeService-技术方案.md#2-系统结构与依赖方向)。依赖精确版本、模型配置及验收仍须按阶段完成，不代表已有可运行实现。
 
 M0 核心链路、V1 企业试点版、后续平台集成是不同交付边界，不得混称。每阶段先确认范围，再实现和验证；不把模拟测试或引用合法率当作真实问答质量验收。
 

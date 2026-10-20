@@ -1,8 +1,10 @@
 # KnowledgeService 技术方案
 
-> 更新日期：2026-10-15  
+> 更新日期：2026-10-20
 > 现行目标架构；不代表对应模块已实现或完成生产验证  
 > 需求来源：[产品需求文档](KnowledgeService-产品需求文档.md)；实施顺序：[实施与验收计划](KnowledgeService-实施与验收计划.md)
+
+S1—S3 的契约、加工／检索／回答规则、分期表结构与 API 规格见[核心链路详细设计](KnowledgeService-核心链路详细设计.md)。本文维护总体架构与长期边界，详细设计只细化实施输入，不代表已有 DDL、OpenAPI 或运行实现。
 
 ## 1. 结论与架构原则
 
@@ -20,6 +22,74 @@
 - 自研领域与流程，窄接口使用成熟组件；不引入一个包办摄取、Agent、记忆和权限的黑盒框架。
 
 ## 2. 系统结构与依赖方向
+
+### 最终目标架构图
+
+下图是本轮定稿的职责架构，不是已部署拓扑。BFF 首版位于 API 进程；模型接入是 API／Worker 复用的进程内模块，不是额外网关服务。平台与其他应用走同一服务契约，知识服务可独立运行。
+
+```mermaid
+flowchart TB
+    portal["知识门户 / 工作台 / 治理控制台：React + TypeScript + Ant Design + TanStack Query"]
+    clients["外部应用 / 平台 Adapter"]
+    idp["OIDC / Keycloak"]
+    subgraph apiProcess["API 进程：FastAPI"]
+        bff["BFF：登录与服务端会话"]
+        auth["入口认证 + 服务端资源授权"]
+        catalog["文档 / 版本 / 发布 / 任务用例"]
+        retrieval["RetrievalService：授权混合召回 + RRF + 可选 Rerank"]
+        answer["回答用例：证据预算 + Prompt + 引用校验 + 交付授权"]
+        delivery["受控历史 / 引用回读 / SSE 进度与结果引用"]
+    end
+    subgraph workerProcess["Worker 进程：同代码库、独立入口"]
+        jobs["任务领取 / 租约 / fencing / 取消"]
+        ingestion["摄取用例：LlamaIndex 转换适配 + 已选解析器"]
+        publishing["项目控制：向量化 / 版本检查 / 索引发布"]
+    end
+    models["共享模型接入模块：Provider 契约 + LangChain 模型适配 / Rerank 适配"]
+    modelApis["获授权模型 API：Embedding / Rerank / LLM"]
+    postgres[("PostgreSQL + pgvector：业务 / ACL / 任务 / 向量 / 全文 / 证据")]
+    blobs[("S3 兼容对象存储：原文 / 解析产物；经 BlobStorage")]
+    quality["离线质量任务：固定评估集 + Ragas + 确定性测试"]
+    telemetry["全链路观测：结构化日志 / 指标 / OpenTelemetry"]
+    portal --> bff
+    bff <--> idp
+    bff --> auth
+    clients --> auth
+    auth --> catalog
+    auth --> retrieval
+    auth --> delivery
+    retrieval --> answer
+    answer --> delivery
+    catalog --> postgres
+    catalog --> blobs
+    retrieval --> postgres
+    answer --> postgres
+    delivery --> postgres
+    delivery --> blobs
+    postgres --> jobs
+    jobs --> ingestion
+    ingestion --> blobs
+    ingestion --> publishing
+    publishing --> postgres
+    publishing --> models
+    retrieval --> models
+    answer --> models
+    models --> modelApis
+    quality -.-> retrieval
+    quality -.-> answer
+    quality -.-> models
+    apiProcess -.-> telemetry
+    workerProcess -.-> telemetry
+```
+
+实线表示主要调用／读写，虚线表示评测与观测联系；身份服务的签名密钥与声明校验由认证适配器处理，图中未逐条画出。任务表属于同一 PostgreSQL，不是额外队列。评测只使用授权样本和预算，不自动外发生产问答。
+
+两条业务链路固定为：
+
+- 摄取：上传 → 原文存储 → 持久任务 → 隔离解析 → 清洗／结构切分／位置映射 → Embedding → 暂存索引 → 项目事务与发布检查；失败不发布，删除／旧租约不能复活文档。
+- 问答：授权查询 → 向量与全文召回 → RRF → 可选重排 → 证据预算与外发检查 → 生成 → 引用校验 → 全证据授权检查 → 保存与交付；无依据拒答，不自动转 Agent。
+
+技术取舍与开源比较见 [ADR-0004](adr/0004-rag-component-architecture.md) 和[开源借鉴第 3.2 节](KnowledgeService-开源借鉴与设计决策.md#32-最终组件选型与相对优势)。以下为代码依赖方向，与运行调用图分开理解。
 
 ```text
 知识门户 / 知识工作台 / 治理控制台 / 外部应用
@@ -61,16 +131,34 @@ contracts/CHANGELOG.md    兼容性变更记录
 src/knowledge_service/
   domain/                 领域对象与规则
   capabilities/           第 5 节各 Capability 的 Protocol
-  application/            用例：摄取、发布、检索、回答、治理、质量
-  providers/              默认实现：postgres、object_storage、oidc、parsing、embedding 等
-  api/                    HTTP 路由与 DTO
+  application/            按业务切片组织，不按框架组织
+    ingestion/            调解析／转换／Embedding 契约，控制摄取阶段
+    catalog/              文档、版本、审核、发布与删除
+    retrieval/            授权候选、RRF、重排与 EvidenceSet
+    answering/            Prompt、生成、引用校验、受控交付
+    governance/           资源授权、保留与审计用例
+    quality/              反馈、评估任务和修复回归
+    model_access/         外发检查、限流、Attempt、调用预算与唯一重试策略
+  providers/              技术适配；框架对象止于此层
+    postgres/             Repository、授权查询、全文／向量召回、任务与 Outbox
+    object_storage/       BlobStorage 的 S3 实现
+    identity/             OIDC、JWT、企业声明适配
+    parsing/              各格式解析器与受限执行适配
+    ingestion/            LlamaIndex 转换、切分、位置映射；不持有权威 docstore
+    models/               LangChain Answer／Embedding、独立 Rerank 适配
+    evaluation/           Ragas 适配，不作为在线 API 启动条件
+    observability/        日志、指标与 OpenTelemetry 出口
+  api/                    HTTP 路由、DTO、BFF 会话入口与 SSE
   worker/                 任务领取、租约、阶段执行
   composition.py          装配根
 migrations/               显式一次性数据库迁移
 cli/                      CLI，契约的真实调用方（S1 之后）
-web/                      门户／工作台／控制台（S3b 之后）
+web/src/                  按业务组织前端（S3b 之后）
+  app/                    路由、认证入口、应用装配
+  features/               documents、search、chat、citations、debug、governance
+  shared/                 通用 UI、API 客户端、基础类型；不放业务规则
 deploy/                   Dockerfile、Compose、环境变量示例
-tests/{unit,integration,fault,security,evaluation,fixtures}
+tests/{architecture,unit,integration,fault,security,evaluation,fixtures}
 docs/adr/                 架构决策记录
 ```
 
@@ -82,7 +170,9 @@ docs/adr/                 架构决策记录
 4. `providers` 实现 `capabilities`，可依赖 `domain`，不依赖 `application`、`api`、`worker`；Provider 之间不互相导入。
 5. `api` 与 `worker` 是平级入口，只调用 `application`，不直接访问 `providers`。
 6. 只有 `composition.py` 同时知道 `providers` 与 `application`，负责依赖注入。
-7. 不导入 OrchestrationPlatform 的任何模块；与平台的一切交互只经 `contracts/openapi`。
+7. KnowledgeService 运行时代码不导入 OrchestrationPlatform 的任何模块；平台集成只经平台无关的 `contracts/openapi` 和标准身份委托契约。平台专属映射由调用方适配器承担，详见 [ADR-0003](adr/0003-platform-decoupling-contract.md)。
+8. LlamaIndex、LangChain、Ragas 仅在对应 `providers` 子包内使用；不暴露其 Node、Document、Message 等类型到领域、数据库契约或 OpenAPI。LlamaIndex 仅执行转换，Embedding 由应用用例另调模型契约，不让两个 Provider 相互导入。
+9. API 与 Worker 共享模型调用用例和配置；底层框架／SDK 隐式重试关闭或显式受唯一策略约束。Ragas 的评判调用也经注入的模型契约与外发预算，不另存一套凭据。
 
 测试按成本和依赖分层，分别运行：`unit` 与 `security`（合成数据，默认不调模型、不联网）、`integration`（真实 PostgreSQL、对象存储、OIDC，需单独条件）、`fault`（租约、并发、重放）、`evaluation`（固定数据集与真实模型，调用前需确认外发范围与预算）。`fixtures` 提供合成资料和至少两租户夹具。
 
@@ -95,17 +185,19 @@ docs/adr/                 架构决策记录
 | API | Python、FastAPI、Pydantic | 锁定版本后以 OpenAPI／契约测试控制升级 |
 | 数据访问 | SQLAlchemy＋psycopg、Alembic | 复杂检索 SQL 可显式实现，不强塞进 ORM |
 | 事实存储 | PostgreSQL | 单一权威来源，暂不维护第二套生产 Repository |
-| 全文检索 | 中文分词 Provider＋PostgreSQL 全文检索 | 用中英文、术语和授权过滤样本验证；不将其自动称为 BM25 |
+| 全文检索 | jieba＋受控业务词典 Provider＋PostgreSQL 全文检索 | 用中英文、术语和授权过滤样本验证；不将其自动称为 BM25 |
 | 向量检索 | pgvector，先精确再评估 ANN | 以目标容量、召回和过滤测试决定索引类型 |
-| 原文件 | S3 兼容对象存储，候选 SeaweedFS，S1b 样本验证后确认（MinIO 社区版已停止维护，见 ADR-0001） | 本地文件仅作测试替身，不替代企业验收的对象存储链路 |
+| 原文件 | S3 兼容对象存储；沿用 RAGFlow v0.27.2 的 PGSTY Silo（MinIO 维护分支）固定镜像作为集成基线，版本与安全门禁见 ADR-0001 | S1b 正常接入验收，不前置多产品选型；本地文件仅作测试替身 |
 | 任务与事件 | PostgreSQL 任务表、Outbox、独立 Worker | 吞吐和故障域证明需要后再引入队列中间件 |
-| 身份 | OIDC；本地 Keycloak | 企业 IdP 通过标准契约接入，不绑定其内部表或专有 SDK |
+| 身份 | OIDC；本地 Keycloak；Authlib 协议客户端与 PostgreSQL 服务端会话 | 企业 IdP 通过标准契约接入，不绑定其内部表或专有 SDK |
 | 前端 | React、TypeScript、Ant Design、TanStack Query | 按门户／工作台／控制台组织，不复制平台业务组件 |
-| 模型 | 独立 Answer／Embedding／Rerank Provider | OpenAI-compatible 为候选默认接口，本地／外部由外发策略决定 |
-| 观测 | 结构化日志、指标、Trace 契约 | OpenTelemetry 作为出口候选，后端选型按部署确定 |
+| 摄取 | LlamaIndex Core 转换流水线＋已定格式解析库 | 复用加载／切分抽象，不启用框架独立 docstore、索引发布或第二套模型入口 |
+| 模型 | LangChain 按需集成包实现独立 Answer／Embedding Provider；Rerank 用合适集成或直接 API | 兼容端点逐能力验证；特殊协议才增加直接 SDK／HTTPX 适配，不维护同功能双实现；不默认外发 |
+| 评测 | Ragas 辅助质量评测＋确定性测试＋固定评估集 | 离线依赖分组；评判模型分数不代替人工抽检或权限、引用、删除测试 |
+| 观测 | 结构化日志、指标、Trace 契约；OpenTelemetry 标准出口 | 不以部署完整外部观测平台作为启动条件 |
 | 部署 | 本地 Compose，应用无状态化接口 | 多副本、托管数据库和独立搜索后端由实测驱动 |
 
-依赖版本、解析库和对象存储产品必须用官方资料与样本验证后锁定。默认后端只实现一套；OpenSearch／Milvus 属于可替换的派生索引 Provider，不同时上线形成长期双写。
+默认组件、固定开源参考与开发参数已在 [ADR-0002](adr/0002-reference-backed-defaults.md) 确定。依赖锁文件、镜像 digest 和接入测试是对应阶段工程交付，不再作为前置全面选型；已知安全问题仍须处理。默认后端只实现一套；OpenSearch／Milvus 属于可替换的派生索引 Provider，不同时上线形成长期双写。
 
 ## 4. 领域模型与版本关系
 
@@ -119,14 +211,17 @@ docs/adr/                 架构决策记录
 | Document | 稳定逻辑资产；类型为文件、网页、知识页面或 FAQ；持有治理状态 |
 | DocumentRevision | 不可变内容版本、来源快照、作者、指纹；原文变化才产生内容修订 |
 | ParseArtifact | 某修订的解析／清洗产物、配置与位置映射；人工修正生成新产物 |
-| ChunkSet / Chunk | 绑定解析产物与分块策略的不可变片段；不覆盖历史片段 |
+| ChunkSet / Chunk | 绑定解析产物与分块策略的不可变片段；词法表示与向量输入按配置另存派生记录，不覆盖历史片段 |
 | Publication / Approval | 被批准的内容修订与解析产物、有效期和策略；审核不等于已上线 |
 | IndexVersion / Manifest | 特定库的可查询清单，绑定发布对象、片段、模型和策略 |
 | IngestionJob / JobAttempt | 输入快照、幂等、阶段、租约、fencing 和安全错误码 |
+| AnswerJob / AnswerAttempt | 回答工作与调用尝试；持久化外部调用意图、结果是否确定及费用状态，与摄取复用任务基础而非新建队列 |
+| Operation | 公共异步命令状态、所有者、截止时间、幂等绑定与结果引用；关联内部任务，不复制队列 |
+| QuestionRecord | 受控问题与查询范围、所有者、Operation 关联；失败请求也可保留受控历史，不把问题写进操作日志 |
 | QueryPlan | 主体授权上下文、选库、各库索引快照、查询策略、预算和配置 |
 | RetrievalCandidate | 通道内候选与排名；不等于有资格进入模型的证据 |
 | EvidenceSet / EvidenceItem | 实际送入模型的全部证据；保存来源、版本、位置、指纹的引用，不保存正文副本，回读时按引用重取并重新授权 |
-| Answer / Citation | 结构化状态与正文；引用只能指向该 Answer 的 EvidenceSet |
+| Answer / Citation | 仅成功回答操作产生，三种业务结果与正文；引用只能指向该 Answer 的 EvidenceSet，不存在 Answer.failed |
 | Feedback / QualityIssue | 用户授权共享的反馈及处理状态，不默认复制问答正文 |
 | EvaluationDataset / Run | 受控数据、标签、模型、策略、索引和指标快照 |
 | AuditEvent / UsageLedger / OutboxEvent | 治理事件、用量与可靠异步传播，均无正文和凭据 |
@@ -161,7 +256,7 @@ docs/adr/                 架构决策记录
 | Answer | generate → structured_draft | 配置的真实模型；无工具或文件权限 |
 | Delivery | finalize、read_answer、read_citation | 当前权限与有效发布检查，失败关闭 |
 | Quality | submit_feedback、evaluate、compare | 固定集与人工标注；评测工具可适配 |
-| Operations | reserve_quota、record_usage、emit_audit | 数据库配额／用量／Outbox；外部观测出口 |
+| Operations | accept_operation、read_operation、cancel_operation、reserve_quota、record_usage、emit_audit | PostgreSQL 操作／任务／配额／用量／Outbox；外部观测出口 |
 
 契约必须说明输入输出、能力声明、Scope、超时、取消、可重试错误、资源释放和实现版本。必要过滤不支持时明确失败，不静默放宽权限。测试替身必须标识，不能把 Mock 通过当真实集成通过。
 
@@ -169,7 +264,7 @@ docs/adr/                 架构决策记录
 
 ### 6.1 登录和主体
 
-浏览器使用 OIDC Authorization Code＋PKCE。默认采用 API 侧会话／BFF 方式：Token 留在服务端，浏览器使用 HttpOnly、Secure、SameSite 会话 Cookie，状态变更接口增加 CSRF 防护；开发回环例外显式配置。具体客户端注册、退出和会话期限在 V-02 固定。
+浏览器使用 OIDC Authorization Code＋PKCE。默认采用 API 侧会话／BFF 方式：Token 留在服务端，浏览器使用 HttpOnly、Secure、SameSite 会话 Cookie，状态变更接口增加 CSRF 防护；开发回环例外显式配置。服务端会话存储、期限与退出默认行为见 ADR-0002 第 3.2 节；实际客户端注册属于 V-02 的 S1b 配置交付。
 
 验证签名、算法允许名单、issuer、audience、有效期和适用客户端；支持 JWKS 轮换。使用 issuer＋subject 映射本地主体，邮箱只作可变属性。IdP 故障时不回退为匿名管理员。
 
@@ -187,13 +282,13 @@ ACL、成员或治理变化更新相应 policy_epoch。缓存以身份、范围�
 
 服务身份访问自身明确授权的资源；代表用户调用需可验证、短期、受众限定的委托。有效权限取服务允许动作、用户当前资源权限和委托范围的交集。不接受任意 user_id／X-Project-ID 作为身份。
 
-独立服务 API 在 V1 验证服务身份与委托。委托协议（签发方、受众、claims、权限映射）属 V-07，须在 S5 实现服务委托前确定；S1 的 OpenAPI 只预留凭据位置与声明形态，不实现签发。平台侧适配在 S7 接入。没有用户委托时不能自动继承某管理员权限。
+身份 profile 已定：门户 OIDC BFF、机器服务账户、外部应用同 realm 标准 Token Exchange 单跳调用；默认不依赖 Preview 委托链或用户冒充。签名令牌中的用户主体与认证客户端分别映射，scope 不代替本地授权；完整流程、有效期和后台任务授权见 [ADR-0003 第 4 节](adr/0003-platform-decoupling-contract.md#4-身份与权限解耦)。V-07 只剩正式 issuer、audience、客户端注册、claims 映射与撤销传播等部署输入，不再等待选择协议。S1 固定契约和身份夹具，S5 独立验证真实身份接入，S7 才接平台，不在本服务实现令牌签发。
 
 ## 7. 来源同步与知识摄取
 
 ### 7.1 可靠输入
 
-上传／同步 → 校验身份、目标与配额 → 写不可变对象 → 短事务建立修订意图、任务及 Outbox → 返回 `202 + job_id`。
+上传／同步 → 校验身份、目标与配额 → 写不可变对象 → 短事务建立修订意图、Operation、任务及 Outbox → 返回 `202 + operation_id + job_id`。公共操作与内部任务同事务衔接，详见 ADR-0003 第 5 节。
 
 幂等键限定 Scope、资源和动作，绑定规范化请求指纹；相同键相同输入返回同一任务，不同输入返回冲突。更新必须显式指定文档及预期修订，同名文件不隐式合并。去重对象不共享权限。
 
@@ -205,7 +300,9 @@ ACL、成员或治理变化更新相应 policy_epoch。缓存以身份、范围�
 
 Job 使用 queued／running／succeeded／failed／cancelled，Stage 独立记录 fetch／parse／clean／chunk／embed／index／publish。Worker 心跳续租，提交携带 fencing token；失去租约的旧 Worker 不得提交。重试有上限、退避和人工处理队列，取消只在安全边界生效。
 
-外部模型可能重复调用，记录 attempt 与费用；预算预留、对账及告警控制重复费用，不声称恰好一次。
+人工审核不占用任务租约：需审核的摄取操作在候选构建完成后 succeeded，结果阶段为 ready_for_review，尚不可检索；审核后以独立发布操作重新校验并上线。免审且已允许自动发布的摄取可在同一操作内完成 publish。该结果阶段不增加 Operation 枚举；超时的 Operation 对应 Job.failed 和安全超时原因。具体事务与恢复点见[详细设计第 4 节](KnowledgeService-核心链路详细设计.md#4-文档摄取与发布详细流程)。
+
+外部模型不保证恰好一次。Attempt 在调用前持久化意图；恢复时若不能证明未发送，不直接重调模型。安全重试、上游幂等／查询恢复和结果未知的规则统一见 ADR-0003 第 5.5 节；业务结果只允许有效提交一次，费用状态独立记账。
 
 ### 7.3 增量连接器
 
@@ -216,6 +313,8 @@ Job 使用 queued／running／succeeded／failed／cancelled，Stage 独立记�
 后续企业连接器必须声明是否支持增量、删除、源 ACL、权限主体映射和检查点。源授权无法可靠映射时禁止自动发布，不将服务账户可见范围自动分享给全库。
 
 ### 7.4 解析和人工修正
+
+各格式默认库与输入限制按 ADR-0002 第 4 节执行；S2 先接 Markdown，S4 再接 Office、文本 PDF 与网页，不重新开展全格式产品选型。
 
 各格式 Provider 输出结构化段落、标题、表格和位置：Markdown 行号、PDF 页码、DOCX 段落、XLSX 工作表与单元格、PPTX 页序、网页快照与段落。保留原始定位与派生映射；表格分块携带列头。
 
@@ -228,6 +327,8 @@ Job 使用 queued／running／succeeded／failed／cancelled，Stage 独立记�
 发布短事务锁定知识库，基于最新 Manifest 合并本次文档变更，使用 CAS 检查文档更新序号，切换 Publication 与活动索引指针，并提交任务成功和 Outbox。不同文档并发更新不能以旧全库清单相互覆盖；同文档慢任务不能覆盖较新更新。
 
 新索引发布前旧批准版本继续服务；更新失败不破坏旧版。紧急撤回、删除、归档和到期由权威状态直接阻止交付，不等待重建。过期检查使用时间条件，定时任务只负责整理状态和索引，不能作为唯一安全控制。
+
+文档 latest_revision_id 仅指最新接纳修订，不能用作公开版本指针；公开内容以活动 Manifest 的 Publication 为准。未发布修订与解析预览需维护／审核动作权限，普通 Reader 不因能读文档而能读待审草稿。
 
 同库 Manifest 只能引用适配该索引模型和策略的派生产物。更换模型时构建整套兼容候选集合，不把不同模型向量混进同一空间。
 
@@ -253,6 +354,8 @@ Outbox 与业务修改同事务，消费者按事件 ID 幂等处理，按资源
 - 混合检索或跨库默认不静默部分成功。降级必须由调用方明确允许，响应列出实际通道／范围与 warning，评测单独统计。
 - 重排是可替换增强；未经质量收益和延迟评测不默认开启。
 
+当前授权还需在每次外发前及同步搜索响应前复查，覆盖 snippets、引用位置、调试排名与计数；自然到期按当前时间判断，不只比较 policy_epoch。候选选定后失效返回 QUERY_SNAPSHOT_STALE，不自动换计划重调模型，也不展示部分旧结果。词法表示按 Chunk＋词法配置独立持久化，查询必须匹配其 IndexVersion 配置；切换词典或模型不覆盖旧快照的派生产物。详细规则见[核心链路详细设计第 5 节](KnowledgeService-核心链路详细设计.md#5-授权检索与重排)。
+
 ### 9.3 证据规则
 
 证据必须非空、当前授权、属于指定快照，且来源关系可被 Manifest 验证。同片段去重，不同内容冒用同 ID 报错。扩展父段或邻接片段时再次授权并计入预算。
@@ -267,9 +370,9 @@ API 返回的每个 EvidenceItem 带 `untrusted_content: true`，契约明确调
 
 EvidenceSet → Answer Provider 结构化草稿 → 引用结构校验 → 当前权限与有效发布重查 → 保存 Answer／Evidence／Citation → 最终交付。
 
-状态统一为 answered／no_answer／clarification_needed／failed。空证据直接无答案；相关但不足允许拒答；范围或业务条件不明确可以请求澄清；索引、模型和引用故障均为失败，不伪装成无答案。
+Answer 业务结果为 answered／no_answer／clarification_needed。空证据直接无答案；相关但不足允许拒答；范围或业务条件不明确可请求澄清。索引、模型和引用故障归 Operation.failed，不创建 Answer.failed、不伪装成无答案；失败请求历史由受控 QuestionRecord 关联 Operation。执行、回答和交付三类状态及合法组合以 ADR-0003 第 5.4 节为准。
 
-结构校验检查引用 ID、证据绑定、修订、位置和指纹，失败草稿不展示。结构合法不能证明断言得到语义支持，固定评测另行验证。第一版流式仅用于进度事件，完整正文通过校验后发送。
+结构校验检查引用 ID、证据绑定、修订、位置和指纹，失败草稿不展示。结构合法不能证明断言得到语义支持，固定评测另行验证。第一版 SSE 仅用于安全进度与结果引用；完整正文通过校验后由 GET Answer 统一交付，不在事件流中重放正文。空证据直接构造 no_answer，不调用模型、不创建空 EvidenceSet。
 
 ### 10.1 历史安全依赖
 
@@ -283,6 +386,12 @@ EvidenceSet → Answer Provider 结构化草稿 → 引用结构校验 → 当�
 
 保存后至实际响应前发生政策变化时仍需最后交付检查；接口不返回未检验的数据库缓存。取消或超时的生成保留安全状态，不留下可读草稿。
 
+### 10.2 历史权威与交付状态
+
+知识服务保存受控问题、Answer 正文和证据引用；普通日志、审计与外部 Adapter 不保存知识正文副本。生成结果与 `delivery_status: available / unavailable` 分离：历史失效不改变原生成结果，资源不可见统一 404，获准查看安全元数据的主体才得到不可交付状态。答案、引用、问题摘要均遵循全证据与历史隐私检查，故障时不回退缓存，响应使用 `Cache-Control: no-store`。
+
+独立门户直接按当前用户回读；外部应用先检查自己的会话范围，再以当前查看者身份回读知识服务。不得使用原提问者委托向其他人展示；首条集成不包含群聊历史共享。保留、删除、费用与日志的权威归属见 [ADR-0003 第 5 节](adr/0003-platform-decoupling-contract.md#5-操作与交付生命周期)。
+
 ## 11. API 与前端边界
 
 API 使用 `/v1`，正式 OpenAPI 在 S1 落地，分页、稳定排序、时间格式、请求大小和错误契约纳入测试。以下为资源设计，不声称已实现。
@@ -290,8 +399,9 @@ API 使用 `/v1`，正式 OpenAPI 在 S1 落地，分页、稳定排序、时间
 契约规则：
 
 - 兼容性：`/v1` 内只增加可选字段和新端点，不删除或改变既有字段语义；新增枚举值须声明调用方应容错；弃用先公告并保留不少于一个版本周期的时间窗，由契约测试保护。
-- 幂等：凡创建任务或产生模型费用的请求（`/imports`、`/sources/{id}/sync`、`/answers`）都接受幂等键，语义同 7.1，并在额度预留前去重，避免重试重复计费。
-- 关联：请求可携带调用方的 `correlation_id`（平台填 run_id 或 run_step_id），原样写入 AuditEvent 和响应，不参与授权；服务自身 request_id 仍独立生成。
+- 幂等：创建任务或产生模型费用的请求（`/imports`、`/sources/{id}/sync`、`/answers`）必须提供 `Idempotency-Key`，在额度预留前按主体、客户端、Scope、动作和请求指纹去重；重传重新授权，不重放旧正文。保留窗口与过期行为见 ADR-0003 第 5 节。
+- 操作：上述命令默认异步 202，返回 `operation_id` 和 Location；查询／取消／超时／终态竞争使用 ADR-0003 第 5 节统一规则。搜索保持同步，不为简单读取创建 Operation。
+- 关联：请求可携带不透明的 `correlation_id`，原样写入 AuditEvent 和响应，不参与授权、幂等或业务状态；调用方可以将自己的运行标识放入其中，但服务不解释其格式；服务自身 `request_id` 仍独立生成。
 - 证据：EvidenceItem 带 `untrusted_content` 标记，见 9.3。
 
 | 资源／用例 | 接口方向 | 约束 |
@@ -299,17 +409,18 @@ API 使用 `/v1`，正式 OpenAPI 在 S1 落地，分页、稳定排序、时间
 | 身份与空间 | `/workspaces`、`/memberships`、`/groups` | Scope 来自已验证身份，不信任请求自报 |
 | 知识库与目录 | `/knowledge-bases`、`/folders` | 角色与动作授权；修改使用预期版本 |
 | 文档／页面／FAQ | `/documents`、`/documents/{id}/revisions` | typed payload，内容不可变修订 |
-| 导入与同步 | `/imports`、`/sources`、`/sources/{id}/sync` | 202＋任务，幂等键与配额 |
+| 导入与同步 | `/imports`、`/sources`、`/sources/{id}/sync` | 导入／同步 202＋操作／任务，幂等键与配额 |
 | 解析与修正 | `/documents/{id}/artifacts`、`/artifacts/{id}/corrections` | 新产物，不原位覆盖 |
 | 审核与发布 | `/reviews`、`/publications`、`/documents/{id}/withdraw` | 绑定修订与产物，审计和 CAS |
-| 搜索／问答 | `/search`、`/answers` | 选库列表、过滤、策略；授权跨库 |
+| 搜索／问答 | `/search`、`/answers` | 搜索同步；回答 202＋操作，完成后按 answer_id 回读；授权跨库 |
+| 操作生命周期 | `/operations/{id}`、`/operations/{id}/cancel` | GET 查询、POST 取消；当前主体授权，仅返回安全状态与结果引用 |
 | 历史／引用 | `/answers/{id}`、`/answers/{id}/citations` | 全证据与当前授权检查 |
 | 反馈／评测 | `/feedback`、`/evaluations` | 共享许可和数据集授权 |
 | 运行治理 | `/jobs`、`/usage`、`/audit-events`、`/model-configs` | 单独管理权限，不返回密钥 |
 
 错误结构为 `error.code / error.message / request_id / retryable`，不返回原始堆栈。401 身份缺失；403 已知资源的操作禁止；404 不存在或不可见；409 幂等／版本冲突；413 超限；422 输入非法；429 配额／限流；502／503 上游故障／不可用。超时使用明确错误码与约定状态。
 
-同步回答中 no_answer／clarification_needed 为业务结果，不用错误码伪装。模型失败返回非 2xx 和安全关联标识；异步任务的资源状态与 HTTP 查询成功分开解释。
+no_answer／clarification_needed 是回答业务结果，不用错误码伪装。命令接纳前失败使用非 2xx；已接纳操作中的模型故障记录 failed 与安全错误。查询操作返回 200 只代表读取成功，不代表操作或回答成功。轮询为默认进度方式，可选进度流不交付未经校验正文。
 
 前端以门户、工作台、控制台分域，服务器状态交给查询层管理。权限变化、空间切换、退出和失效通知清理敏感缓存；重新验证期间隐藏正文，不使用 stale 数据回退。批量动作逐项反馈，不能暗示跨文件原子成功。
 
@@ -319,9 +430,11 @@ API 使用 `/v1`，正式 OpenAPI 在 S1 落地，分页、稳定排序、时间
 
 评测固定数据、标签、模型、策略、索引及授权上下文，分别报告解析保真、Recall@K、证据覆盖、引用结构、语义支持、拒答、延迟和费用。先比较全文／向量／混合，再测试重排或图扩展。
 
-Trace 用 request_id、job_id、answer_id、evaluation_id 及调用方 correlation_id 关联，日志只记录数量、状态、版本、耗时和安全错误。指标覆盖任务积压、租约超时、来源新鲜度、检索空命中、模型失败、交付拒绝、预算和备份结果。指标标签避免携带问题正文及高敏感资源名称。
+Ragas 通过 Evaluation Provider 接入，负责支持的回答忠实度与上下文相关指标；指标定义、评判模型、提示模板、版本和失败样本一并记录。确定性 Recall@K、引用绑定、权限、撤权和删除测试独立运行；缺失评判配置或外发许可时明确标为未评测，不伪造通过。S3 即建立基线和 Rerank 开关对照，S5 才扩展评测管理 UI 与完整运营闭环。
 
-配额在提交时预留、完成后结算，失败／取消释放未用额度；外部成本超时不确定时记录待对账，不无限重试。组织、空间和应用限流分别生效，防止单一连接器或用户耗尽 Worker。
+Trace 用 request_id、operation_id、job_id、answer_id、evaluation_id 及调用方 correlation_id 关联，日志只记录数量、状态、版本、耗时和安全错误。关联字段限制长度并安全编码，不记录问题或凭据。指标覆盖任务积压、租约超时、来源新鲜度、检索空命中、模型失败、交付拒绝、预算和备份结果。指标标签避免携带问题正文及高敏感资源名称。
+
+配额在提交时预留、完成后结算，失败／取消只释放确认未用额度。外部费用未知记为 pending_reconciliation，不按零费用结算；无查询能力时标明无法自动核实，由人工按可用账单处理，不无限重试。账单未到不否定已持久化的有效答案；结果未知但尚无终态时按 UPSTREAM_OUTCOME_UNKNOWN 失败关闭，已有取消／超时终态不被覆盖。组织、空间和应用限流分别生效，防止单一连接器或用户耗尽 Worker。
 
 ## 13. 安全、保留与恢复
 
@@ -361,31 +474,31 @@ Trace 用 request_id、job_id、answer_id、evaluation_id 及调用方 correlati
 
 ## 15. 与平台集成及后续演进
 
-平台通过 RemoteKnowledgeProvider 调用稳定 API，传递受众正确的服务身份／用户委托，显式映射 project 与 Workspace。返回 answer_id、EvidenceSet 标识、引用及关联 ID；平台在自己的 RunStep 记录调用，不把知识任务改名成平台 Run。
+KnowledgeService 通过平台无关的 `/v1` API 提供搜索、回答、引用回读和状态查询。`RemoteKnowledgeProvider`／Adapter 放在 OrchestrationPlatform 调用侧，负责受众正确的服务身份／用户委托、project→Workspace 映射、超时／重试／取消和平台结果转换。服务返回 `answer_id`、EvidenceSet 标识、引用及不透明关联 ID；平台在自己的 RunStep 记录调用，不把知识任务改名成平台 Run。
 
-平台交付需同时满足知识授权和会话披露范围。历史消息应通过受控回读或失效状态展示，不能将答案复制进永久可见缓存。先验证一条“检索／回答／撤权／回读”链路，再扩展 Bot 和工作流入口。
+平台交付需同时满足知识授权和会话披露范围。历史消息应通过受控回读或失效状态展示，不能将答案复制成平台自己的知识事实或永久可见缓存。KnowledgeService 不要求平台存在即可独立完成自身 API、任务、搜索、回答和撤权验收；先验证一条“检索／回答／撤权／回读”链路，再扩展 Bot 和工作流入口。
 
-### 15.1 接入模式与平台契约差异
+### 15.1 目标接入模式与调用方责任
 
 两种接入模式的保证强度不同，契约和文档必须分开命名：
 
 - 服务端回答：平台调用 `/answers`，由服务生成、校验并交付，全证据检查完整有效。首条链路采用此模式。
 - 平台端生成：平台只调 `/search`，用自己的模型生成。证据离开服务边界后，全证据检查只覆盖服务存档的 EvidenceSet；平台须保存 `evidence_set_id`，展示前回读校验，并接受已交付内容无法撤回。
 
-平台现有 `knowledge_qa` 契约（`OrchestrationPlatform` 提交 `c7e1223`）与本服务的差异，S7 前核对，由平台侧适配，不让服务迁就：
+忽略平台旧知识问答实现，不设计其存储或 DTO 迁移兼容。以知识服务能力定义目标 Adapter：
 
-| 平台契约现状 | 本服务 | 处理 |
+| 服务契约 | 调用方责任 | 首条链路边界 |
 | --- | --- | --- |
-| 作用域为 tenant_id＋project_id，EvidenceSet 绑定单个 knowledge_base_id 与 index_version_id | Tenant／Workspace／KB，跨库为 KB→index_version 映射 | project 显式映射 Workspace；首条链路限单库，跨库需先扩展平台契约 |
-| 答案状态含 `retrieval_degraded` | 四种状态，默认不静默降级 | 仅调用方显式允许降级时，适配器才映射为 `retrieval_degraded` |
-| `StoredKnowledgeAnswer` 持久化 `RetrievalResult.snippet`，且要求 `run_id` | 证据只存引用，回读重新授权 | 远程 Provider 模式下平台不持久化服务证据正文，只存 answer_id、evidence_set_id、引用；`run_id` 作为 correlation_id 传入 |
-| `KnowledgeAnswerStore` 只有 save／get，无交付重查与失效状态 | 回读必须重查权限与证据 | 平台为知识消息新增回读校验和“已失效”展示状态 |
-| `KnowledgeQuestion.actor_subject_id` 由平台自报 | 不接受自报身份 | 平台经 V-07 的委托协议传递，服务不信任该字段 |
-| IngestionJob 阶段与状态集合不同 | 服务独立维护任务模型 | 平台不镜像服务任务，只引用 job_id |
+| Tenant／Workspace／KB，跨库为 KB→IndexVersion 映射 | 显式配置本地业务范围到 Workspace，不以同名自动授权 | 首链单库，不限制服务自身 S4 跨库能力 |
+| 标准身份 profile、资源权限交集 | 取得用户 access token 并交换正确受众，登记调用客户端 | 当前提问者身份，不能自报 user_id |
+| 操作／回答／交付三个独立状态 | 保留原始错误语义，转换展示 | 不把失败、撤权或超时改成降级成功 |
+| Idempotency-Key、operation_id、correlation_id | 同命令重传复用键；查询／取消服务操作；本地关联 Run | 不镜像知识任务，不解释 correlation_id |
+| Answer 与 EvidenceSet 为服务权威 | 只长期保留结果引用与本地关联，展示前重新回读 | 当前查看者为提问者本人，不做群聊共享 |
+| 无权／失效／服务不可用均不得展示旧正文 | 清理展示缓存，显示安全状态 | 不依赖旧平台答案存储或 DTO |
 
-接入约束：平台把证据交给自己的模型时，必须按 `untrusted_content` 当数据处理，不得作为指令拼接。
+接入约束：平台把证据交给自己的模型时，必须按 `untrusted_content` 当数据处理，不得作为指令拼接。平台端生成模式不是首条链路；启用前由 Adapter 保存 evidence_set_id，并在展示前回读校验。
 
-Wiki 链接、Entity／Relation／Claim／Ontology 未来作为有来源和版本依赖的派生产物加入，图扩展候选仍要授权并进入 EvidenceSet。人工页面与 FAQ 已属于 V1，不需要等待 GraphRAG。LangChain、LangGraph 等只在存在明确组件收益时通过 Provider 适配，不成为公共模型或治理事实来源。
+Wiki 链接、Entity／Relation／Claim／Ontology 未来作为有来源和版本依赖的派生产物加入，图扩展候选仍要授权并进入 EvidenceSet。人工页面与 FAQ 已属于 V1，不需要等待 GraphRAG。LangChain 已作为模型适配的默认实现；LangGraph、Agent 和第二套检索编排不进入首版，不成为公共模型或治理事实来源。
 
 ## 16. 验证策略
 
